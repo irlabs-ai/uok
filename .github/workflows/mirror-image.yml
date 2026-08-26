@@ -1,0 +1,303 @@
+name: mirror-image
+
+# Digest-identical mirror of the uok runtime image: internal registry →
+# ghcr.io/irlabs-ai/uok. A mirror, never a rebuild — the shipped image is
+# built in the private release pipeline from signature-verified release
+# bytes (the committed Dockerfile is that build's recipe, published here for
+# transparency), and this workflow copies each version's whole multi-arch
+# manifest list as-is, so the public list digest and both per-arch child
+# digests byte-equal the internal ones. Every run hard-asserts that
+# equality and fails loudly on any inequality. The copy tool is pinned by
+# version + sha256 — no unpinned installs.
+#
+# Tag semantics mirror the internal registry's immutable tags:
+# re-dispatching an already-mirrored version must find byte-identical
+# digests (a no-op re-verify) or the run fails — a mirrored tag is never
+# overwritten.
+#
+# Credentials: the source pull rides a read-only OIDC role whose trust is
+# pinned to refs/heads/main of this repository — a run from any other ref
+# cannot assume it, so this workflow only works dispatched from main
+# (branch CI is lint-only). The GHCR push uses this repository's own
+# GITHUB_TOKEN and nothing else. dry_run (the default) does everything
+# except the push: role assumption, source digest resolution, a copy into a
+# local OCI layout, and the would-push digest, all exercised and reported.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to mirror (bare X.Y.Z; must already be published to the internal registry as a dual-arch manifest list)"
+        required: true
+        type: string
+      dry_run:
+        description: "Resolve digests and copy to a local OCI layout, but push nothing to GHCR (default true; flip to false only for the real mirror)"
+        required: false
+        type: boolean
+        default: true
+
+# One mirror at a time, never cancelled mid-push: an interrupted push is
+# exactly the half-state the pre-check exists to rule out.
+concurrency:
+  group: mirror-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # OIDC for the read-only internal pull role.
+  id-token: write
+  # The GHCR push, with this repository's own GITHUB_TOKEN.
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      UOK_MIRROR_INPUT_VERSION: ${{ inputs.version }}
+      UOK_IMAGE_PULL_ROLE_ARN: ${{ secrets.UOK_IMAGE_PULL_ROLE_ARN }}
+      ECR_REGISTRY: 943273443988.dkr.ecr.us-east-1.amazonaws.com
+      ECR_REPOSITORY: uok/toolchain
+      GHCR_IMAGE: ghcr.io/irlabs-ai/uok
+      AWS_REGION: us-east-1
+      # regctl (regclient) does the digest-preserving copies. Bump the pin
+      # deliberately: version and binary sha256 together, computed from the
+      # upstream release's regctl-linux-amd64 asset.
+      REGCTL_VERSION: v0.11.5
+      REGCTL_SHA256: c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467
+    steps:
+      - name: Assert mirror configuration
+        # Fail-closed gates, all before any credential. The main-ref guard
+        # states what the role trust enforces anyway: the pull role's OIDC
+        # trust is pinned to refs/heads/main of this repository, so no
+        # other ref can assume it. The version is normalized exactly once,
+        # here (an optional leading v is tolerated; everything downstream
+        # uses the bare form).
+        run: |
+          failed=0
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "mirror-image must be dispatched from refs/heads/main — the pull role's OIDC trust is pinned to main (got '$GITHUB_REF')" >&2
+            failed=1
+          fi
+          ver="${UOK_MIRROR_INPUT_VERSION#v}"
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "version must be bare X.Y.Z (got '$UOK_MIRROR_INPUT_VERSION')" >&2
+            failed=1
+          fi
+          if [ -z "$UOK_IMAGE_PULL_ROLE_ARN" ]; then
+            echo "UOK_IMAGE_PULL_ROLE_ARN secret is not set — the read-only pull role for the internal registry is not configured." >&2
+            failed=1
+          fi
+          [ "$failed" -eq 0 ] || exit 1
+          {
+            echo "UOK_MIRROR_VERSION=$ver"
+            echo "ECR_REF=$ECR_REGISTRY/$ECR_REPOSITORY:$ver"
+            echo "GHCR_REF=$GHCR_IMAGE:$ver"
+            echo "LAYOUT_REF=ocidir://$RUNNER_TEMP/mirror-layout:$ver"
+            echo "WORK_DIR=$RUNNER_TEMP/mirror"
+          } >> "$GITHUB_ENV"
+
+      - name: Install regctl (pinned by version + sha256)
+        run: |
+          mkdir -p "$WORK_DIR/bin"
+          curl -fsSLo "$WORK_DIR/bin/regctl" \
+            "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
+          echo "${REGCTL_SHA256}  $WORK_DIR/bin/regctl" | sha256sum -c -
+          chmod +x "$WORK_DIR/bin/regctl"
+          echo "$WORK_DIR/bin" >> "$GITHUB_PATH"
+          "$WORK_DIR/bin/regctl" version
+
+      - name: Configure AWS credentials (read-only image pull role)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.UOK_IMAGE_PULL_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to both registries
+        # The internal side is a short-lived ECR password from the assumed
+        # read-only role; the public side is this repository's own
+        # GITHUB_TOKEN (needed on dry runs too — the immutability pre-check
+        # reads GHCR).
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | regctl registry login "$ECR_REGISTRY" --user AWS --pass-stdin
+          printf '%s' "$GHCR_TOKEN" \
+            | regctl registry login ghcr.io --user "$GITHUB_ACTOR" --pass-stdin
+
+      - name: Resolve the internal digests (the mirror's source of truth)
+        # Three digests from the registry's own records (describe-images),
+        # cross-checked against the manifest bytes regctl actually fetches:
+        # the raw list must hash to the digest ECR records for the tag, and
+        # the list's child entries must be exactly the digests the child
+        # tags hold. Any disagreement means the source is not in the shape
+        # this mirror vouches for — stop before touching GHCR.
+        id: ecr
+        run: |
+          mkdir -p "$WORK_DIR"
+          resolve() {
+            aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids imageTag="$1" \
+              --query 'imageDetails[0].imageDigest' --output text
+          }
+          list_digest="$(resolve "$UOK_MIRROR_VERSION")"
+          amd64_digest="$(resolve "$UOK_MIRROR_VERSION-linux-amd64")"
+          arm64_digest="$(resolve "$UOK_MIRROR_VERSION-linux-arm64")"
+          regctl manifest get "$ECR_REF" --format raw-body > "$WORK_DIR/ecr-list.json"
+          fetched="sha256:$(sha256sum "$WORK_DIR/ecr-list.json" | cut -d' ' -f1)"
+          if [ "$fetched" != "$list_digest" ]; then
+            echo "the manifest list fetched from $ECR_REF hashes to $fetched but the registry records $list_digest for the tag" >&2
+            exit 1
+          fi
+          listed_amd64="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$WORK_DIR/ecr-list.json")"
+          listed_arm64="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$WORK_DIR/ecr-list.json")"
+          if [ "$listed_amd64" != "$amd64_digest" ] || [ "$listed_arm64" != "$arm64_digest" ]; then
+            echo "the list's child entries (amd64 $listed_amd64, arm64 $listed_arm64) do not match the child tags (amd64 $amd64_digest, arm64 $arm64_digest)" >&2
+            exit 1
+          fi
+          {
+            echo "list=$list_digest"
+            echo "amd64=$amd64_digest"
+            echo "arm64=$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Copy to a local OCI layout and compute the would-push digest
+        # The copy is list-as-is: regctl copies the index and both children
+        # without re-encoding, so the layout's top-level digest IS the
+        # would-push digest — and it must equal the internal list digest. A
+        # copy tool that rewrote manifests (compression, media-type or
+        # encoding changes) fails here, before any push.
+        env:
+          ECR_LIST_DIGEST: ${{ steps.ecr.outputs.list }}
+        run: |
+          regctl image copy "$ECR_REF" "$LAYOUT_REF"
+          would_push="$(regctl manifest head "$LAYOUT_REF")"
+          if [ "$would_push" != "$ECR_LIST_DIGEST" ]; then
+            echo "the local copy's digest $would_push does not equal the internal list digest $ECR_LIST_DIGEST — the copy tool rewrote the manifest; refusing to mirror" >&2
+            exit 1
+          fi
+          echo "Would push: $GHCR_REF@$would_push (manifest list, linux/amd64 + linux/arm64)"
+
+      - name: Pre-check the GHCR tag (immutability semantics)
+        # Mirrored tags follow the internal contract: a re-dispatched
+        # version must already hold exactly the internal bytes (then the
+        # push is skipped and the assertions below re-verify), anything
+        # else fails — a mirrored tag is never overwritten. A GHCR answer
+        # that is not a clean 404 fails too: never guess about the target.
+        id: precheck
+        env:
+          ECR_LIST_DIGEST: ${{ steps.ecr.outputs.list }}
+        run: |
+          set +e
+          out="$(regctl manifest head "$GHCR_REF" 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            if [ "$out" = "$ECR_LIST_DIGEST" ]; then
+              echo "GHCR tag :$UOK_MIRROR_VERSION already holds exactly the internal bytes ($out) — nothing to push; the equality assertions still run."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+            else
+              echo "GHCR tag :$UOK_MIRROR_VERSION already exists with digest $out, but the internal list is $ECR_LIST_DIGEST. Mirrored tags are immutable: a published version is never overwritten. If the public tag is wrong, that is an incident to raise, not a re-push to force." >&2
+              exit 1
+            fi
+          else
+            case "$out" in
+              *"not found [http 404]"*|*MANIFEST_UNKNOWN*|*NAME_UNKNOWN*)
+                echo "GHCR tag :$UOK_MIRROR_VERSION is unpublished — proceeding."
+                echo "action=push" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "$out" >&2
+                echo "could not determine whether $GHCR_REF exists (the error above is not a clean 404) — refusing to guess" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Dry run — report what would be pushed
+        if: ${{ inputs.dry_run }}
+        env:
+          ECR_LIST_DIGEST: ${{ steps.ecr.outputs.list }}
+          ECR_AMD64_DIGEST: ${{ steps.ecr.outputs.amd64 }}
+          ECR_ARM64_DIGEST: ${{ steps.ecr.outputs.arm64 }}
+          PRECHECK_ACTION: ${{ steps.precheck.outputs.action }}
+        run: |
+          echo "DRY RUN — nothing was pushed."
+          echo "Would push: $GHCR_REF (digest-identical mirror of $ECR_REF)"
+          echo "List digest:        $ECR_LIST_DIGEST"
+          echo "linux/amd64 child:  $ECR_AMD64_DIGEST"
+          echo "linux/arm64 child:  $ECR_ARM64_DIGEST"
+          echo "GHCR pre-check:     $PRECHECK_ACTION"
+          {
+            echo "## DRY RUN — would mirror \`$ECR_REF\` → \`$GHCR_REF\`"
+            echo ""
+            echo "| | |"
+            echo "| -- | -- |"
+            echo "| list digest | \`$ECR_LIST_DIGEST\` |"
+            echo "| linux/amd64 child | \`$ECR_AMD64_DIGEST\` |"
+            echo "| linux/arm64 child | \`$ECR_ARM64_DIGEST\` |"
+            echo "| GHCR pre-check | $PRECHECK_ACTION |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push the mirror (the whole list, digests preserved)
+        if: ${{ !inputs.dry_run && steps.precheck.outputs.action == 'push' }}
+        # Push from the local layout: the bytes that leave this runner are
+        # exactly the bytes the would-push digest was computed on.
+        run: regctl image copy "$LAYOUT_REF" "$GHCR_REF"
+
+      - name: Assert digest equality — GHCR must byte-equal the internal registry
+        if: ${{ !inputs.dry_run }}
+        # The contract, asserted after the fact from the target registry's
+        # own answers: the GHCR list digest equals the internal list digest,
+        # each child entry equals the internal child tag's digest, and both
+        # children are fetchable from GHCR at those digests. Any inequality
+        # fails the run loudly. This step runs on the skip path too — a
+        # re-dispatch of an existing version is a full re-verify.
+        env:
+          ECR_LIST_DIGEST: ${{ steps.ecr.outputs.list }}
+          ECR_AMD64_DIGEST: ${{ steps.ecr.outputs.amd64 }}
+          ECR_ARM64_DIGEST: ${{ steps.ecr.outputs.arm64 }}
+        run: |
+          ghcr_list="$(regctl manifest head "$GHCR_REF")"
+          if [ "$ghcr_list" != "$ECR_LIST_DIGEST" ]; then
+            echo "GHCR list digest $ghcr_list does not equal the internal list digest $ECR_LIST_DIGEST — the mirror is not digest-identical" >&2
+            exit 1
+          fi
+          regctl manifest get "$GHCR_REF" --format raw-body > "$WORK_DIR/ghcr-list.json"
+          ghcr_amd64="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$WORK_DIR/ghcr-list.json")"
+          ghcr_arm64="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$WORK_DIR/ghcr-list.json")"
+          failed=0
+          if [ "$ghcr_amd64" != "$ECR_AMD64_DIGEST" ]; then
+            echo "linux/amd64 child differs: GHCR $ghcr_amd64 vs internal $ECR_AMD64_DIGEST" >&2
+            failed=1
+          fi
+          if [ "$ghcr_arm64" != "$ECR_ARM64_DIGEST" ]; then
+            echo "linux/arm64 child differs: GHCR $ghcr_arm64 vs internal $ECR_ARM64_DIGEST" >&2
+            failed=1
+          fi
+          for child in "$ghcr_amd64" "$ghcr_arm64"; do
+            regctl manifest head "$GHCR_IMAGE@$child" > /dev/null || {
+              echo "child manifest $child is not fetchable from GHCR — the list references bytes the registry does not serve" >&2
+              failed=1
+            }
+          done
+          [ "$failed" -eq 0 ] || exit 1
+          echo "Mirrored $GHCR_REF@$ghcr_list — digest-identical to $ECR_REF (linux/amd64 $ghcr_amd64, linux/arm64 $ghcr_arm64)"
+          {
+            echo "## Mirrored \`$ECR_REF\` → \`$GHCR_REF\`"
+            echo ""
+            echo "| | internal (ECR) | public (GHCR) |"
+            echo "| -- | -- | -- |"
+            echo "| list digest | \`$ECR_LIST_DIGEST\` | \`$ghcr_list\` |"
+            echo "| linux/amd64 child | \`$ECR_AMD64_DIGEST\` | \`$ghcr_amd64\` |"
+            echo "| linux/arm64 child | \`$ECR_ARM64_DIGEST\` | \`$ghcr_arm64\` |"
+            echo ""
+            echo "All equal — the public image IS the internal image."
+            echo ""
+            echo "One-time step for versions that predate the"
+            echo "\`org.opencontainers.image.source\` label: connect the package to"
+            echo "the irlabs-ai/uok repository in the GHCR package settings (later"
+            echo "versions auto-link via the label). The package stays PRIVATE —"
+            echo "visibility is a launch decision, not this workflow's."
+          } >> "$GITHUB_STEP_SUMMARY"
